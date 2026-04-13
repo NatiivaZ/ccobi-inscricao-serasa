@@ -9,7 +9,12 @@ Funcionalidades:
 
 import time
 import os
+import random
 from datetime import datetime
+
+def _ts() -> str:
+    """Retorna horário atual no formato HH:MM:SS (usado como timestamp nos resultados)."""
+    return datetime.now().strftime("%H:%M:%S")
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
@@ -305,7 +310,121 @@ class BaseAutomacao:
                 return True
             except:
                 return False
-    
+
+    @staticmethod
+    def _mensagem_erro_navegacao(exc):
+        """ChromeDriver às vezes retorna exceção com str() vazio — monta mensagem útil."""
+        msg = (str(exc) or "").strip()
+        if msg:
+            return msg
+        msg = getattr(exc, "msg", None) or ""
+        if msg and str(msg).strip():
+            return str(msg).strip()
+        return f"{type(exc).__name__} (sem mensagem do driver — possível timeout, overlay ou janela fechada)"
+
+    def _hover_e_clicar_submenu(self, xpath_hover, xpath_link, descricao="menu", xpath_link_fallback=None):
+        """
+        Hover no item do menu principal e clique no link do submenu.
+        Inclui espera de overlay, scroll, hover real + eventos JS de mouse,
+        pausa para o submenu abrir, retry e clique via JS.
+        """
+        for tentativa in range(4):
+            try:
+                self._neutralizar_barra_governo()
+                self._aguardar_overlay_sumir(timeout=10)
+                hover_el = WebDriverWait(self.driver, 45, poll_frequency=0.3).until(
+                    EC.presence_of_element_located((By.XPATH, xpath_hover))
+                )
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center', behavior:'instant'});", hover_el
+                )
+                time.sleep(0.10)
+                ActionChains(self.driver).move_to_element(hover_el).pause(0.20).perform()
+                self.driver.execute_script(
+                    "var el=arguments[0];"
+                    "['mouseover','mouseenter','mousemove'].forEach(function(evt){"
+                    "  el.dispatchEvent(new MouseEvent(evt,{bubbles:true,cancelable:true,view:window}));"
+                    "});",
+                    hover_el,
+                )
+                time.sleep(0.45)
+                self._aguardar_overlay_sumir(timeout=6)
+                try:
+                    link = WebDriverWait(self.driver, 22, poll_frequency=0.25).until(
+                        EC.presence_of_element_located((By.XPATH, xpath_link))
+                    )
+                except TimeoutException:
+                    if not xpath_link_fallback:
+                        raise
+                    link = WebDriverWait(self.driver, 8, poll_frequency=0.25).until(
+                        EC.presence_of_element_located((By.XPATH, xpath_link_fallback))
+                    )
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center', behavior:'instant'});", link
+                )
+                self.driver.execute_script("arguments[0].click();", link)
+                time.sleep(0.50)
+                return True
+            except Exception as exc:
+                if xpath_link_fallback:
+                    try:
+                        clicou_fallback = self.driver.execute_script(
+                            "var xp = arguments[0];"
+                            "var el = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;"
+                            "if(!el) return false;"
+                            "el.click();"
+                            "return true;",
+                            xpath_link_fallback,
+                        )
+                        if clicou_fallback:
+                            time.sleep(0.50)
+                            return True
+                    except Exception:
+                        pass
+                self.logger.log(
+                    f"Navegação «{descricao}» — tentativa {tentativa + 1}/4: {self._mensagem_erro_navegacao(exc)}",
+                    "WARNING",
+                )
+                time.sleep(0.8 + tentativa * 0.25)
+        return False
+
+    def _neutralizar_barra_governo(self):
+        """
+        A barra amarela do governo (bgBarraAmarelaGoverno) pode interceptar cliques
+        no topo durante transições/postbacks. Neutraliza ponteiros sem remover layout.
+        """
+        try:
+            self.driver.execute_script(
+                "var el=document.querySelector('.bgBarraAmarelaGoverno');"
+                "if(el){el.style.pointerEvents='none';el.style.zIndex='0';}"
+                "var el2=document.querySelector('.barraGoverno');"
+                "if(el2){el2.style.pointerEvents='none';el2.style.zIndex='0';}"
+            )
+        except Exception:
+            pass
+
+    def _clicar_portal_sistemas_se_existir(self) -> bool:
+        """Clica em Portal de Sistemas se o botão aparecer; retorna True se clicou, False se não existir."""
+        xpath_portal = (
+            '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_'
+            'ContentPlaceHolderCorpo_btnPortalSistemas"]'
+        )
+        try:
+            self._aguardar_overlay_sumir(timeout=6)
+            btn = WebDriverWait(self.driver, 6, poll_frequency=0.3).until(
+                EC.element_to_be_clickable((By.XPATH, xpath_portal))
+            )
+            self.logger.log("Clicando no botão Portal de Sistemas...", "INFO")
+            self.driver.execute_script("arguments[0].click();", btn)
+            time.sleep(2.2)
+            return True
+        except TimeoutException:
+            self.logger.log("Botão Portal de Sistemas não encontrado, continuando...", "INFO")
+            return False
+        except Exception as exc:
+            self.logger.log(f"Portal de Sistemas: {self._mensagem_erro_navegacao(exc)} — continuando...", "WARNING")
+            return False
+
     def fechar(self):
         """Fecha o navegador"""
         if self.driver:
@@ -314,6 +433,47 @@ class BaseAutomacao:
                 self.logger.log("Navegador fechado.", "INFO")
             except:
                 pass
+
+
+# ─────────────────────────────────────────────────────────────
+# Checkpoint — retomar de onde parou
+# ─────────────────────────────────────────────────────────────
+
+import json as _json
+
+class CheckpointManager:
+    """Salva e carrega o progresso da automação para permitir retomar de onde parou."""
+
+    def __init__(self, caminho_planilha: str):
+        from pathlib import Path as _Path
+        base = _Path(__file__).resolve().parent / "checkpoints"
+        base.mkdir(exist_ok=True)
+        nome = _Path(caminho_planilha).stem.replace(" ", "_")
+        self.path = base / f"checkpoint_{nome}.json"
+
+    def existe(self) -> bool:
+        return self.path.exists()
+
+    def salvar(self, idx_atual: int, total: int, resultados: list):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                _json.dump({"idx": idx_atual, "total": total, "resultados": resultados}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def carregar(self) -> dict:
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                return _json.load(f)
+        except Exception:
+            return {}
+
+    def limpar(self):
+        try:
+            if self.path.exists():
+                self.path.unlink()
+        except Exception:
+            pass
 
 
 class AutomacaoConsultaPagamento(BaseAutomacao):
@@ -325,79 +485,34 @@ class AutomacaoConsultaPagamento(BaseAutomacao):
     
     def navegar_para_formulario(self):
         """Navega até o formulário de consulta"""
+        xp_menu0 = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn0"]/table/tbody/tr/td/a'
+        xp_menu5 = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn5"]/td/table/tbody/tr/td/a'
+        xp_menu5_abs = '/html/body/form/div[4]/div[3]/table/tbody/tr/td[1]/div[8]/table/tbody/tr[1]/td/table/tbody/tr/td/a'
+        xp_m2 = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_menun2"]/table/tbody/tr/td/a'
+        xp_m19 = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_menun19"]/td/table/tbody/tr/td/a'
+        xp_campo = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_txbAutoInfracao"]'
         try:
             self.logger.log("Navegando até o formulário de consulta...", "INFO")
-            
-            # Hover no primeiro elemento
-            elemento_hover_1 = self.wait.until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn0"]/table/tbody/tr/td/a'))
-            )
-            ActionChains(self.driver).move_to_element(elemento_hover_1).perform()
-            time.sleep(0.8)
-            
-            # Clicar no botão que aparece
-            botao_1 = self.wait.until(
-                EC.element_to_be_clickable((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn5"]/td/table/tbody/tr/td/a'))
-            )
-            botao_1.click()
-            time.sleep(2)
-            
-            # Após clicar nos dois primeiros botões, clicar no botão "Portal de Sistemas" se aparecer
-            try:
-                botao_portal = self.wait.until(
-                    EC.element_to_be_clickable((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_btnPortalSistemas"]'))
-                )
-                self.logger.log("Clicando no botão Portal de Sistemas...", "INFO")
-                botao_portal.click()
-                time.sleep(2)
-                
-                # Após clicar no Portal de Sistemas, clicar novamente nos dois botões
+            self._aguardar_overlay_sumir(timeout=12)
+            if not self._hover_e_clicar_submenu(xp_menu0, xp_menu5, "Sistemas → submenu", xp_menu5_abs):
+                raise TimeoutException("Falha ao abrir primeiro submenu do menu Sistemas")
+            if self._clicar_portal_sistemas_se_existir():
                 self.logger.log("Clicando novamente nos botões de navegação...", "INFO")
-                elemento_hover_1_novo = self.wait.until(
-                    EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn0"]/table/tbody/tr/td/a'))
-                )
-                ActionChains(self.driver).move_to_element(elemento_hover_1_novo).perform()
-                time.sleep(0.8)
-                
-                botao_1_novo = self.wait.until(
-                    EC.element_to_be_clickable((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn5"]/td/table/tbody/tr/td/a'))
-                )
-                botao_1_novo.click()
-                time.sleep(2)
-            except:
-                # Se o botão não aparecer, continua normalmente
-                self.logger.log("Botão Portal de Sistemas não encontrado, continuando...", "INFO")
-            
-            # Hover no segundo elemento
-            elemento_hover_2 = self.wait.until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_menun2"]/table/tbody/tr/td/a'))
+                if not self._hover_e_clicar_submenu(xp_menu0, xp_menu5, "Sistemas → submenu (após Portal)", xp_menu5_abs):
+                    raise TimeoutException("Falha ao repetir menu após Portal de Sistemas")
+            if not self._hover_e_clicar_submenu(xp_m2, xp_m19, "Consulta → formulário"):
+                raise TimeoutException("Falha ao abrir formulário de consulta (menu nível 2)")
+            WebDriverWait(self.driver, 40, poll_frequency=0.3).until(
+                EC.presence_of_element_located((By.XPATH, xp_campo))
             )
-            ActionChains(self.driver).move_to_element(elemento_hover_2).perform()
-            time.sleep(0.3)
-            
-            # Clicar no botão que aparece
-            botao_2 = self.wait.until(
-                EC.element_to_be_clickable((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_menun19"]/td/table/tbody/tr/td/a'))
-            )
-            botao_2.click()
-            time.sleep(0.5)
-            
-            # Aguardar campo aparecer
-            self.wait.until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_txbAutoInfracao"]'))
-            )
-            
-            # Verificar se há erro de servidor após navegação
             if self.verificar_erro_servidor():
                 self.logger.log("Erro de servidor detectado após navegação!", "ERROR")
                 if not self.tratar_erro_servidor(tentar_navegar_novamente=False):
                     return False
-            
             self.logger.log("Formulário de consulta carregado!", "SUCCESS")
             return True
-            
         except Exception as e:
-            self.logger.log(f"Erro na navegação: {str(e)}", "ERROR")
+            self.logger.log(f"Erro na navegação: {self._mensagem_erro_navegacao(e)}", "ERROR")
             return False
     
     def consultar_auto(self, numero_auto):
@@ -908,80 +1023,34 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
     
     def navegar_para_formulario(self):
         """Navega até o formulário de inscrição na SERASA"""
+        xp_menu0 = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn0"]/table/tbody/tr/td/a'
+        xp_menu5 = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn5"]/td/table/tbody/tr/td/a'
+        xp_menu5_abs = '/html/body/form/div[4]/div[3]/table/tbody/tr/td[1]/div[8]/table/tbody/tr[1]/td/table/tbody/tr/td/a'
+        xp_serasa = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_menun4"]/table/tbody/tr/td/a'
+        xp_inscricao = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_menun43"]/td/table/tbody/tr/td/a'
+        xp_campo = '//*[@id="Corpo_txbAutoInfracao"]'
         try:
             self.logger.log("Navegando até o formulário de inscrição SERASA...", "INFO")
-            
-            # Hover no primeiro elemento
-            elemento_hover_1 = self.wait.until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn0"]/table/tbody/tr/td/a'))
-            )
-            ActionChains(self.driver).move_to_element(elemento_hover_1).perform()
-            time.sleep(0.3)
-            
-            # Clicar no botão que aparece
-            botao_1 = self.wait.until(
-                EC.element_to_be_clickable((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn5"]/td/table/tbody/tr/td/a'))
-            )
-            botao_1.click()
-            time.sleep(0.5)
-            
-            # Após clicar nos dois primeiros botões, clicar no botão "Portal de Sistemas" se aparecer
-            try:
-                botao_portal = self.wait.until(
-                    EC.element_to_be_clickable((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_btnPortalSistemas"]'))
-                )
-                self.logger.log("Clicando no botão Portal de Sistemas...", "INFO")
-                botao_portal.click()
-                time.sleep(1.5)  # Manter um pouco mais pois pode ter carregamento
-                
-                # Após clicar no Portal de Sistemas, clicar novamente nos dois botões
+            self._aguardar_overlay_sumir(timeout=12)
+            if not self._hover_e_clicar_submenu(xp_menu0, xp_menu5, "Sistemas → submenu", xp_menu5_abs):
+                raise TimeoutException("Falha ao abrir primeiro submenu do menu Sistemas")
+            if self._clicar_portal_sistemas_se_existir():
                 self.logger.log("Clicando novamente nos botões de navegação...", "INFO")
-                elemento_hover_1_novo = self.wait.until(
-                    EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn0"]/table/tbody/tr/td/a'))
-                )
-                ActionChains(self.driver).move_to_element(elemento_hover_1_novo).perform()
-                time.sleep(0.3)
-                
-                botao_1_novo = self.wait.until(
-                    EC.element_to_be_clickable((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn5"]/td/table/tbody/tr/td/a'))
-                )
-                botao_1_novo.click()
-                time.sleep(0.5)
-            except:
-                # Se o botão não aparecer, continua normalmente
-                self.logger.log("Botão Portal de Sistemas não encontrado, continuando...", "INFO")
-            
-            # Agora seguir com a navegação específica da SERASA
-            # Hover em "Serasa"
-            elemento_serasa = self.wait.until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_menun4"]/table/tbody/tr/td/a'))
+                if not self._hover_e_clicar_submenu(xp_menu0, xp_menu5, "Sistemas → submenu (após Portal)", xp_menu5_abs):
+                    raise TimeoutException("Falha ao repetir menu após Portal de Sistemas")
+            if not self._hover_e_clicar_submenu(xp_serasa, xp_inscricao, "Serasa → Inscrição"):
+                raise TimeoutException("Falha ao abrir formulário de inscrição SERASA (menu Serasa)")
+            WebDriverWait(self.driver, 40, poll_frequency=0.3).until(
+                EC.presence_of_element_located((By.XPATH, xp_campo))
             )
-            ActionChains(self.driver).move_to_element(elemento_serasa).perform()
-            time.sleep(0.3)
-            
-            # Clicar no botão que aparece
-            botao_inscricao = self.wait.until(
-                EC.element_to_be_clickable((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_menun42"]/td/table/tbody/tr/td/a'))
-            )
-            botao_inscricao.click()
-            time.sleep(0.5)
-            
-            # Aguardar campo aparecer
-            self.wait.until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="Corpo_txbAutoInfracao"]'))
-            )
-            
-            # Verificar se há erro de servidor após navegação
             if self.verificar_erro_servidor():
                 self.logger.log("Erro de servidor detectado após navegação!", "ERROR")
                 if not self.tratar_erro_servidor(tentar_navegar_novamente=False):
                     return False
-            
             self.logger.log("Formulário de inscrição SERASA carregado!", "SUCCESS")
             return True
-            
         except Exception as e:
-            self.logger.log(f"Erro na navegação: {str(e)}", "ERROR")
+            self.logger.log(f"Erro na navegação: {self._mensagem_erro_navegacao(e)}", "ERROR")
             return False
     
     def pesquisar_auto(self, numero_auto):
@@ -1185,7 +1254,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
         """Clica no checkbox via JS e aguarda o sistema registrar (espera por condição, não sleep fixo)."""
         try:
             self._aguardar_overlay_sumir(timeout=5)
-            time.sleep(0.25)  # Estabilizar antes do clique
+            time.sleep(0.15)  # Estabilizar antes do clique
             resultado = self.driver.execute_script(
                 "var b=document.getElementById('wings_process_presentation_dashboard_bar');"
                 "if(b)b.style.display='none';"
@@ -1196,12 +1265,12 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
             )
             if not resultado:
                 return False
-            # Espera por condição: segue assim que o checkbox ficar marcado (até 4s)
-            return self._aguardar_checkbox_marcado(timeout=4)
+            # Espera por condição: segue assim que o checkbox ficar marcado (até 3s)
+            return self._aguardar_checkbox_marcado(timeout=3)
         except Exception:
             return False
 
-    def _checkbox_foi_validado(self, max_tentativas=5, intervalo=0.5):
+    def _checkbox_foi_validado(self, max_tentativas=4, intervalo=0.3):
         """Verifica com retentativas se o checkbox está marcado. Só retorna True se realmente estiver checked."""
         for _ in range(max_tentativas):
             try:
@@ -1312,23 +1381,63 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
             self.logger.log(f"Erro ao limpar formulário: {str(e)}", "ERROR")
             return False
     
-    def processar_autos(self, autos, progress_callback=None, stats_callback=None, error_handler=None):
+    def _verificar_sessao_expirada(self) -> bool:
+        """Retorna True se a sessão expirou (voltou para tela de login)."""
+        try:
+            url = self.driver.current_url or ""
+            return "Login" in url or "login" in url.lower()
+        except Exception:
+            return False
+
+    def processar_autos(self, autos, progress_callback=None, stats_callback=None,
+                        error_handler=None, checkpoint: "CheckpointManager | None" = None,
+                        idx_inicio: int = 0):
         """Processa todos os autos apenas selecionando checkboxes (sem incluir na SERASA)"""
         total = len(autos)
         sucessos = 0
         erros = 0
-        
-        for idx, auto in enumerate(autos):
+
+        # Carregar resultados já salvos no checkpoint (se retomando)
+        if checkpoint and checkpoint.existe() and idx_inicio > 0:
+            dados_cp = checkpoint.carregar()
+            resultados_anteriores = dados_cp.get("resultados", [])
+            for r in resultados_anteriores:
+                self.resultados.append(r)
+                if r.get("situacao") == "SELECIONADO":
+                    sucessos += 1
+                else:
+                    erros += 1
+
+        for idx in range(idx_inicio, total):
+            auto = str(autos[idx]).strip()
             if self.parar:
                 break
-            
-            auto = str(auto).strip()
             if not auto:
                 continue
+
+            # ── Melhoria 5: detecção de sessão expirada ──
+            if self._verificar_sessao_expirada():
+                self.logger.log("Sessão expirada detectada — refazendo login automaticamente...", "WARNING")
+                if self.usuario_login and self.senha_login:
+                    if self.fazer_login(self.usuario_login, self.senha_login):
+                        if not self.navegar_para_formulario():
+                            self.logger.log("Não foi possível renavegar após sessão expirada. Interrompendo.", "ERROR")
+                            break
+                        self.logger.log("Sessão restaurada com sucesso.", "SUCCESS")
+                    else:
+                        self.logger.log("Falha ao refazer login após sessão expirada. Interrompendo.", "ERROR")
+                        break
+                else:
+                    self.logger.log("Credenciais não disponíveis para restaurar sessão. Interrompendo.", "ERROR")
+                    break
             
             try:
                 if progress_callback:
                     progress_callback(f"Processando {idx+1}/{total}: {auto}")
+
+                # ── Melhoria 3: delay humanizado — variação aleatória entre autos ──
+                if idx > idx_inicio:
+                    time.sleep(random.uniform(0.10, 0.35))
                 
                 # Pesquisar auto (com uma retentativa se falhar — evita perder auto por stale transitório)
                 if not self.pesquisar_auto(auto):
@@ -1336,7 +1445,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                     time.sleep(0.6)
                     if not self.pesquisar_auto(auto):
                         self.logger.log(f"Auto {auto}: Erro ao pesquisar (timeout/conexão/stale)", "ERROR")
-                        self.resultados.append({'auto': auto, 'situacao': 'ERRO AO PESQUISAR'})
+                        self.resultados.append({'auto': auto, 'situacao': 'ERRO AO PESQUISAR', 'horario': _ts()})
                         erros += 1
                         if stats_callback:
                             stats_callback(sucessos, erros)
@@ -1368,7 +1477,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                             if status == "erro_servidor":
                                 # Se ainda tiver erro, marcar e continuar
                                 self.logger.log(f"Auto {auto}: Erro de servidor persiste após retentar!", "ERROR")
-                                self.resultados.append({'auto': auto, 'situacao': 'ERRO DE SERVIDOR'})
+                                self.resultados.append({'auto': auto, 'situacao': 'ERRO DE SERVIDOR', 'horario': _ts()})
                                 erros += 1
                                 if stats_callback:
                                     stats_callback(sucessos, erros)
@@ -1380,7 +1489,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                         else:
                             # Se falhou ao pesquisar, marcar como erro
                             self.logger.log(f"Auto {auto}: Falha ao pesquisar após tratar erro!", "ERROR")
-                            self.resultados.append({'auto': auto, 'situacao': 'ERRO DE SERVIDOR'})
+                            self.resultados.append({'auto': auto, 'situacao': 'ERRO DE SERVIDOR', 'horario': _ts()})
                             erros += 1
                             if stats_callback:
                                 stats_callback(sucessos, erros)
@@ -1390,7 +1499,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                     else:
                         # Se falhou ao tratar erro, marcar e continuar
                         self.logger.log(f"Auto {auto}: Falha ao tratar erro de servidor!", "ERROR")
-                        self.resultados.append({'auto': auto, 'situacao': 'ERRO DE SERVIDOR'})
+                        self.resultados.append({'auto': auto, 'situacao': 'ERRO DE SERVIDOR', 'horario': _ts()})
                         erros += 1
                         if stats_callback:
                             stats_callback(sucessos, erros)
@@ -1404,7 +1513,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                 
                 if status == "nao_encontrado":
                     self.logger.log(f"Auto {auto}: Não encontrado na caixa", "WARNING")
-                    self.resultados.append({'auto': auto, 'situacao': 'NÃO ENCONTRADO NA CAIXA'})
+                    self.resultados.append({'auto': auto, 'situacao': 'NÃO ENCONTRADO NA CAIXA', 'horario': _ts()})
                     erros += 1
                     if stats_callback:
                         stats_callback(sucessos, erros)
@@ -1416,7 +1525,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                 
                 elif status == "multiplos":
                     self.logger.log(f"Auto {auto}: Múltiplos resultados encontrados ({quantidade})", "WARNING")
-                    self.resultados.append({'auto': auto, 'situacao': 'MÚLTIPLOS RESULTADOS'})
+                    self.resultados.append({'auto': auto, 'situacao': 'MÚLTIPLOS RESULTADOS', 'horario': _ts()})
                     erros += 1
                     if stats_callback:
                         stats_callback(sucessos, erros)
@@ -1437,30 +1546,30 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                                 "var cb=document.querySelector('#Corpo_gdvAutoInfracao_ckSelecionar_0');"
                                 "if(cb)cb.click();"
                             )
-                            time.sleep(0.9)
+                            time.sleep(0.5)
                         # Validação: checkbox deve estar marcado (várias tentativas)
                         if not self._checkbox_foi_validado():
                             self.logger.log(f"Auto {auto}: Clique no checkbox não foi validado pelo sistema (não contou).", "WARNING")
-                            self.resultados.append({'auto': auto, 'situacao': 'CLIQUE NÃO VALIDADO'})
+                            self.resultados.append({'auto': auto, 'situacao': 'CLIQUE NÃO VALIDADO', 'horario': _ts()})
                             erros += 1
                             if stats_callback:
                                 stats_callback(sucessos, erros)
                         # Confirmação dupla: após mais um delay, checkbox ainda deve estar marcado
-                        elif not self._checkbox_ainda_marcado_apos_delay(delay=0.5):
+                        elif not self._checkbox_ainda_marcado_apos_delay(delay=0.3):
                             self.logger.log(f"Auto {auto}: Checkbox não permaneceu marcado após confirmação (não contou).", "WARNING")
-                            self.resultados.append({'auto': auto, 'situacao': 'CLIQUE NÃO CONFIRMADO'})
+                            self.resultados.append({'auto': auto, 'situacao': 'CLIQUE NÃO CONFIRMADO', 'horario': _ts()})
                             erros += 1
                             if stats_callback:
                                 stats_callback(sucessos, erros)
                         else:
                             self.logger.log(f"Auto {auto}: Checkbox selecionado e validado (confirmação dupla)!", "SUCCESS")
-                            self.resultados.append({'auto': auto, 'situacao': 'SELECIONADO'})
+                            self.resultados.append({'auto': auto, 'situacao': 'SELECIONADO', 'horario': _ts()})
                             sucessos += 1
                             if stats_callback:
                                 stats_callback(sucessos, erros)
                     except Exception as e:
                         self.logger.log(f"Auto {auto}: Erro ao selecionar checkbox: {str(e)}", "ERROR")
-                        self.resultados.append({'auto': auto, 'situacao': 'ERRO AO SELECIONAR'})
+                        self.resultados.append({'auto': auto, 'situacao': 'ERRO AO SELECIONAR', 'horario': _ts()})
                         erros += 1
                         if stats_callback:
                             stats_callback(sucessos, erros)
@@ -1471,7 +1580,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                 
             except Exception as e:
                 self.logger.log(f"Erro ao processar auto {auto}: {str(e)}", "ERROR")
-                self.resultados.append({'auto': auto, 'situacao': 'ERRO'})
+                self.resultados.append({'auto': auto, 'situacao': 'ERRO', 'horario': _ts()})
                 erros += 1
                 if stats_callback:
                     stats_callback(sucessos, erros)
@@ -1493,7 +1602,15 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                         self._preparar_proximo_auto(autos[idx + 1])
                     except:
                         pass
+
+            # ── Melhoria 1: salvar checkpoint após cada auto ──
+            if checkpoint:
+                checkpoint.salvar(idx + 1, total, list(self.resultados))
         
+        # Checkpoint concluído — limpar arquivo
+        if checkpoint:
+            checkpoint.limpar()
+
         return sucessos, erros
     
     def _preparar_proximo_auto(self, proximo_auto):
@@ -1519,7 +1636,8 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
             for resultado in self.resultados:
                 dados.append({
                     'Autos de infração': resultado['auto'],
-                    'Situação': resultado['situacao']
+                    'Situação': resultado['situacao'],
+                    'Horário': resultado.get('horario', '')
                 })
             df_resultado = pd.DataFrame(dados)
             if caminho.suffix.lower() == '.csv':
@@ -1534,23 +1652,81 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
         except Exception as e:
             self.logger.log(f"Erro ao salvar resultados: {str(e)}", "ERROR")
             return None
-    
+
+    def salvar_log_excel(self, caminho_planilha: str):
+        """Exporta todo o histórico de logs para uma aba extra na planilha de resultados."""
+        try:
+            if not caminho_planilha or not caminho_planilha.endswith(".xlsx"):
+                return
+            from datetime import datetime as _dt
+            wb = load_workbook(caminho_planilha)
+            nome_aba = "Log"
+            if nome_aba in wb.sheetnames:
+                del wb[nome_aba]
+            ws_log = wb.create_sheet(nome_aba)
+            # Cabeçalho
+            fill_hdr = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+            font_hdr = Font(bold=True, color="FFFFFF", size=10)
+            for col_idx, titulo in enumerate(["Horário", "Tipo", "Mensagem"], start=1):
+                c = ws_log.cell(row=1, column=col_idx, value=titulo)
+                c.fill = fill_hdr
+                c.font = font_hdr
+                c.alignment = Alignment(horizontal="center", vertical="center")
+            ws_log.column_dimensions["A"].width = 22
+            ws_log.column_dimensions["B"].width = 12
+            ws_log.column_dimensions["C"].width = 80
+            # Mapeamento de cores por tipo
+            cores_tipo = {
+                "SUCCESS": "C6EFCE",
+                "ERROR":   "FFC7CE",
+                "WARNING": "FFEB9C",
+                "INFO":    "DDEBF7",
+            }
+            for row_idx, linha in enumerate(self.logger.logs, start=2):
+                # Formato esperado: [HH:MM:SS] [TIPO] Mensagem
+                partes = linha.strip().split("] ", 2)
+                horario = partes[0].lstrip("[") if len(partes) >= 1 else ""
+                tipo = partes[1].lstrip("[") if len(partes) >= 2 else ""
+                mensagem = partes[2] if len(partes) >= 3 else linha
+                ws_log.cell(row=row_idx, column=1, value=horario)
+                ws_log.cell(row=row_idx, column=2, value=tipo)
+                c_msg = ws_log.cell(row=row_idx, column=3, value=mensagem)
+                cor = cores_tipo.get(tipo, "FFFFFF")
+                fill_row = PatternFill(start_color=cor, end_color=cor, fill_type="solid")
+                for col in range(1, 4):
+                    ws_log.cell(row=row_idx, column=col).fill = fill_row
+            wb.save(caminho_planilha)
+            self.logger.log("Log exportado para aba 'Log' na planilha de resultados.", "INFO")
+        except Exception as e:
+            self.logger.log(f"Erro ao salvar log em Excel: {str(e)}", "WARNING")
+
     def _aplicar_formatacao_excel(self, caminho_excel, nome_coluna_situacao):
-        """Aplica formatação de tabela e cabeçalho colorido na planilha Excel"""
+        """Aplica formatação de tabela, cabeçalho colorido e cores por status na planilha Excel"""
+        # Mapeamento de cores por situação
+        _CORES_STATUS = {
+            "SELECIONADO":           ("C6EFCE", "375623"),  # verde
+            "ERRO":                  ("FFC7CE", "9C0006"),  # vermelho
+            "CLIQUE NÃO VALIDADO":   ("FFEB9C", "9C5700"),  # amarelo
+            "CLIQUE NÃO CONFIRMADO": ("FFEB9C", "9C5700"),  # amarelo
+            "ERRO AO SELECIONAR":    ("FFC7CE", "9C0006"),  # vermelho
+            "AUTO NÃO ENCONTRADO":   ("FCE4D6", "843C0C"),  # laranja
+        }
         try:
             wb = load_workbook(caminho_excel)
             ws = wb.active
             
-            # Definir largura das colunas
+            # Definir largura das colunas (A=auto, B=situação, C=horário)
             ws.column_dimensions['A'].width = 25
-            ws.column_dimensions['B'].width = 25
+            ws.column_dimensions['B'].width = 28
+            ws.column_dimensions['C'].width = 20
             
             # Formatar cabeçalho (linha 1)
             fill_cabecalho = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
             font_cabecalho = Font(bold=True, color="FFFFFF", size=11)
             alignment_cabecalho = Alignment(horizontal="center", vertical="center")
             
-            for col in range(1, 3):  # Colunas A e B
+            n_cols = ws.max_column
+            for col in range(1, n_cols + 1):
                 cell = ws.cell(row=1, column=col)
                 cell.fill = fill_cabecalho
                 cell.font = font_cabecalho
@@ -1564,15 +1740,33 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                 bottom=Side(style='thin')
             )
             
-            # Aplicar bordas em todas as células com dados
+            # Localizar coluna de situação
+            col_situacao = None
+            for col in range(1, n_cols + 1):
+                if ws.cell(row=1, column=col).value == nome_coluna_situacao:
+                    col_situacao = col
+                    break
+
+            # Aplicar bordas e cores por status
             max_row = ws.max_row
             for row in range(1, max_row + 1):
-                for col in range(1, 3):
+                for col in range(1, n_cols + 1):
                     ws.cell(row=row, column=col).border = thin_border
+                # Colorir linha de dados com base no status
+                if row > 1 and col_situacao:
+                    status = str(ws.cell(row=row, column=col_situacao).value or "")
+                    if status in _CORES_STATUS:
+                        bg, fg = _CORES_STATUS[status]
+                        fill_row = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
+                        font_row = Font(color=fg, size=10)
+                        for col in range(1, n_cols + 1):
+                            ws.cell(row=row, column=col).fill = fill_row
+                            ws.cell(row=row, column=col).font = font_row
             
             # Criar tabela (formato de tabela Excel)
             if max_row > 1:
-                tab = Table(displayName="TabelaResultados", ref=f"A1:B{max_row}")
+                col_letra = "ABC"[n_cols - 1] if n_cols <= 3 else "C"
+                tab = Table(displayName="TabelaResultados", ref=f"A1:{col_letra}{max_row}")
                 style = TableStyleInfo(
                     name="TableStyleMedium9",
                     showFirstColumn=False,
@@ -1585,7 +1779,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
             
             # Centralizar dados nas células
             for row in range(2, max_row + 1):
-                for col in range(1, 3):
+                for col in range(1, n_cols + 1):
                     ws.cell(row=row, column=col).alignment = Alignment(horizontal="center", vertical="center")
             
             wb.save(caminho_excel)
@@ -1821,6 +2015,12 @@ class InterfaceGrafica:
                                             font=("Arial", 9, "bold"), relief=tk.RAISED,
                                             cursor='hand2', state=tk.DISABLED)
         self.btn_gerar_planilha.pack(side=tk.LEFT, padx=5)
+
+        self.btn_exportar_log = tk.Button(frame_controles, text="📋 Exportar Log",
+                                          command=self.exportar_log_agora, bg='#7f8c8d', fg='white',
+                                          font=("Arial", 9, "bold"), relief=tk.RAISED,
+                                          cursor='hand2')
+        self.btn_exportar_log.pack(side=tk.LEFT, padx=5)
         
         # Progresso
         self.progress_var = tk.StringVar(value="Aguardando...")
@@ -1828,7 +2028,7 @@ class InterfaceGrafica:
                                       fg="blue", font=("Arial", 9), bg='#f0f0f0')
         self.label_progress.pack(pady=5)
         
-        self.progress_bar = ttk.Progressbar(self.frame_principal, mode='indeterminate')
+        self.progress_bar = ttk.Progressbar(self.frame_principal, mode='determinate', maximum=100)
         self.progress_bar.pack(fill=tk.X, pady=5, padx=10)
     
     def mostrar_tela_login(self):
@@ -2014,8 +2214,36 @@ class InterfaceGrafica:
                 
                 self.autos = df[coluna_auto].dropna().astype(str).tolist()
                 self.autos = [a for a in self.autos if a.lower() != 'auto de infração' and a.strip() != '']
-                
-                messagebox.showinfo("Sucesso", f"Planilha carregada!\n{len(self.autos)} autos encontrados.")
+
+                # ── Melhoria 4: verificar duplicatas ──
+                from collections import Counter as _Counter
+                contagem = _Counter(self.autos)
+                duplicatas = {a: n for a, n in contagem.items() if n > 1}
+                msg_carregado = f"Planilha carregada!\n{len(self.autos)} autos encontrados."
+                if duplicatas:
+                    lista_dup = "\n".join(f"  {a} ({n}x)" for a, n in list(duplicatas.items())[:10])
+                    sufixo = f"\n...e mais {len(duplicatas)-10} outros." if len(duplicatas) > 10 else ""
+                    msg_carregado += (
+                        f"\n\n⚠️ {len(duplicatas)} auto(s) duplicado(s) detectado(s):\n"
+                        f"{lista_dup}{sufixo}\n\n"
+                        "Os duplicatas serão processados quantas vezes aparecerem na planilha.\n"
+                        "Deseja remover os duplicatas automaticamente?"
+                    )
+                    remover = messagebox.askyesno("Duplicatas encontradas", msg_carregado)
+                    if remover:
+                        vistos = set()
+                        autos_sem_dup = []
+                        for a in self.autos:
+                            if a not in vistos:
+                                vistos.add(a)
+                                autos_sem_dup.append(a)
+                        removidos = len(self.autos) - len(autos_sem_dup)
+                        self.autos = autos_sem_dup
+                        messagebox.showinfo("Duplicatas removidas", f"{removidos} auto(s) duplicado(s) removido(s).\nTotal final: {len(self.autos)} autos.")
+                    else:
+                        messagebox.showinfo("Planilha carregada", f"Planilha carregada com {len(self.autos)} autos (incluindo duplicatas).")
+                else:
+                    messagebox.showinfo("Sucesso", msg_carregado)
             except Exception as e:
                 messagebox.showerror("Erro", f"Erro ao ler planilha:\n{str(e)}")
     
@@ -2034,7 +2262,7 @@ class InterfaceGrafica:
         self.btn_iniciar.config(state=tk.DISABLED)
         self.btn_pausar.config(state=tk.NORMAL)
         self.btn_parar.config(state=tk.NORMAL)
-        self.progress_bar.start()
+        self.progress_bar['value'] = 0
         
         # Limpar logs e estatísticas
         self.text_logs.delete(1.0, tk.END)
@@ -2066,6 +2294,11 @@ class InterfaceGrafica:
         # Não reutilizar navegador headless - será criado visível na automação
         
         # Executar em thread
+        # ── Melhoria 4: rastreamento de tempo para ETA ──
+        self._tempo_inicio_auto = None       # timestamp do início do primeiro auto
+        self._idx_atual_eta = 0              # índice processado mais recente
+        self._total_autos_eta = len(self.autos)
+
         self.thread_automacao = threading.Thread(target=self._executar_automacao, 
                                                   args=(self.usuario_logado, self.senha_logada), daemon=True)
         self.thread_automacao.start()
@@ -2073,6 +2306,26 @@ class InterfaceGrafica:
     def _executar_automacao(self, usuario, senha):
         """Executa a automação em thread separada"""
         try:
+            # ── Melhoria 1: verificar checkpoint ──
+            checkpoint = CheckpointManager(self.planilha_path) if self.planilha_path else None
+            idx_inicio = 0
+            if checkpoint and checkpoint.existe():
+                dados_cp = checkpoint.carregar()
+                idx_cp = dados_cp.get("idx", 0)
+                total_cp = dados_cp.get("total", len(self.autos))
+                if 0 < idx_cp < total_cp:
+                    resposta = messagebox.askyesno(
+                        "Checkpoint encontrado",
+                        f"Foi encontrado um progresso anterior: {idx_cp}/{total_cp} autos processados.\n\n"
+                        f"Deseja continuar de onde parou (a partir do auto {idx_cp + 1})?\n\n"
+                        f"Clique 'Não' para recomeçar do zero."
+                    )
+                    if resposta:
+                        idx_inicio = idx_cp
+                        self.logger.log(f"Retomando de onde parou: auto {idx_inicio + 1}/{total_cp}", "INFO")
+                    else:
+                        checkpoint.limpar()
+
             # Criar driver visível (não headless) para a automação
             if not self.automacao.criar_driver(headless=False):
                 self.root.after(0, self._finalizar_automacao, False)
@@ -2093,13 +2346,19 @@ class InterfaceGrafica:
             # Processar autos
             sucessos, erros = self.automacao.processar_autos(
                 self.autos,
-                progress_callback=self._atualizar_progresso,
+                progress_callback=self._atualizar_progresso_com_eta,
                 stats_callback=self.atualizar_estatisticas,
-                error_handler=self._tratar_erro
+                error_handler=self._tratar_erro,
+                checkpoint=checkpoint,
+                idx_inicio=idx_inicio
             )
             
             # Salvar resultados
             caminho_resultado = self.automacao.salvar_resultados(self.planilha_path)
+
+            # ── Melhoria 3: exportar log para aba extra no Excel ──
+            if caminho_resultado:
+                self.automacao.salvar_log_excel(caminho_resultado)
             
             # Verificar se é automação de Inscrição SERASA (não fechar navegador)
             is_inscricao_serasa = isinstance(self.automacao, AutomacaoInscricaoSerasa)
@@ -2117,7 +2376,7 @@ class InterfaceGrafica:
                 mensagem += f"Resultados salvos em:\n{caminho_resultado}"
             
             if is_inscricao_serasa:
-                mensagem += "\n\n⚠️ Navegador permanece aberto.\nVocê pode clicar em 'Incluir na SERASA' manualmente quando quiser."
+                mensagem += "\n\nNavegador permanece aberto.\nVocê pode clicar em 'Incluir na SERASA' manualmente quando quiser."
             
             self.root.after(0, self._finalizar_automacao, True, mensagem)
             
@@ -2127,8 +2386,42 @@ class InterfaceGrafica:
                 self.automacao.fechar()
             self.root.after(0, self._finalizar_automacao, False, f"Erro: {str(e)}")
     
+    def _atualizar_progresso_com_eta(self, mensagem: str):
+        """Atualiza barra determinística, ETA e velocidade em tempo real."""
+        import re as _re
+        pct = self.progress_bar['value']
+        match = _re.search(r"(\d+)/(\d+)", mensagem)
+        if match:
+            idx = int(match.group(1))
+            total = int(match.group(2))
+            if total > 0:
+                pct = round((idx / total) * 100, 1)
+            agora = time.monotonic()
+            if self._tempo_inicio_auto is None or idx <= 1:
+                self._tempo_inicio_auto = agora
+                self._idx_atual_eta = idx
+            else:
+                concluidos = idx - 1
+                if concluidos > 0:
+                    tempo_decorrido = agora - self._tempo_inicio_auto
+                    media_por_auto = tempo_decorrido / concluidos
+                    # ETA
+                    restantes = total - idx
+                    eta_segundos = int(media_por_auto * restantes)
+                    if eta_segundos >= 60:
+                        eta_str = f"~{eta_segundos // 60}min {eta_segundos % 60}s restantes"
+                    else:
+                        eta_str = f"~{eta_segundos}s restantes"
+                    # Velocidade (autos/min)
+                    vel = round(60 / media_por_auto, 1) if media_por_auto > 0 else 0
+                    mensagem = f"{mensagem}  |  {eta_str}  |  {vel} autos/min"
+        def _update(m=mensagem, v=pct):
+            self.progress_var.set(m)
+            self.progress_bar['value'] = v
+        self.root.after(0, _update)
+
     def _atualizar_progresso(self, mensagem):
-        """Atualiza mensagem de progresso"""
+        """Atualiza mensagem de progresso (versão simples sem ETA)"""
         self.root.after(0, lambda: self.progress_var.set(mensagem))
     
     def _tratar_erro(self, auto, erro):
@@ -2140,7 +2433,7 @@ class InterfaceGrafica:
     
     def _finalizar_automacao(self, sucesso, mensagem=None):
         """Finaliza a automação"""
-        self.progress_bar.stop()
+        self.progress_bar['value'] = 100 if sucesso else self.progress_bar['value']
         self.btn_iniciar.config(state=tk.NORMAL)
         self.btn_pausar.config(state=tk.DISABLED)
         self.btn_continuar.config(state=tk.DISABLED)
@@ -2164,6 +2457,15 @@ class InterfaceGrafica:
         else:
             self.btn_gerar_planilha.config(state=tk.DISABLED)
         
+        # ── Melhoria 2: resumo detalhado por status ──
+        if sucesso and self.automacao and self.automacao.resultados:
+            from collections import Counter as _Counter
+            contagem = _Counter(r.get('situacao', 'DESCONHECIDO') for r in self.automacao.resultados)
+            linhas_resumo = [f"  {status}: {qtd}" for status, qtd in sorted(contagem.items())]
+            resumo = "\n".join(linhas_resumo)
+            if mensagem:
+                mensagem = mensagem.rstrip() + f"\n\n── Resumo por status ──\n{resumo}"
+
         if mensagem:
             if sucesso:
                 messagebox.showinfo("Concluído", mensagem)
@@ -2214,7 +2516,7 @@ class InterfaceGrafica:
         self.btn_iniciar.config(state=tk.DISABLED)
         self.btn_pausar.config(state=tk.NORMAL)
         self.btn_parar.config(state=tk.NORMAL)
-        self.progress_bar.start()
+        self.progress_bar['value'] = 0
         self.text_logs.insert(tk.END, "\n--- Reprocessando apenas erros ---\n", "INFO")
         self.sucessos = 0
         self.erros = 0
@@ -2263,6 +2565,24 @@ class InterfaceGrafica:
         except Exception as e:
             self.logger.log(f"Erro ao gerar planilha: {str(e)}", "ERROR")
             messagebox.showerror("Erro", f"Erro ao gerar planilha:\n{str(e)}")
+
+    def exportar_log_agora(self):
+        """Exporta o log atual para um arquivo .txt imediatamente."""
+        try:
+            base_dir = Path(__file__).resolve().parent
+            log_dir = base_dir / "logs"
+            log_dir.mkdir(exist_ok=True)
+            nome_arquivo = f"log_exportado_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            caminho = log_dir / nome_arquivo
+            conteudo = self.logger.get_logs()
+            if not conteudo.strip():
+                messagebox.showinfo("Exportar Log", "Não há logs para exportar ainda.")
+                return
+            caminho.write_text(conteudo, encoding="utf-8")
+            self.logger.log(f"Log exportado manualmente: {caminho}", "INFO")
+            messagebox.showinfo("Log exportado", f"Log salvo com sucesso em:\n{caminho}")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao exportar log:\n{str(e)}")
 
     def executar(self):
         """Executa a interface"""
