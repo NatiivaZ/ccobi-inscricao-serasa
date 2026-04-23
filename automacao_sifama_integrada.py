@@ -11,10 +11,6 @@ import time
 import os
 import random
 from datetime import datetime
-
-def _ts() -> str:
-    """Retorna horário atual no formato HH:MM:SS (usado como timestamp nos resultados)."""
-    return datetime.now().strftime("%H:%M:%S")
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
@@ -32,51 +28,19 @@ from tkinter import filedialog, messagebox, ttk, scrolledtext
 from pathlib import Path
 import threading
 
-
-class Logger:
-    """Sistema de logging para a automação (tela + arquivo opcional)."""
-
-    def __init__(self, log_callback=None):
-        self.logs = []
-        self.log_callback = log_callback
-        self.log_file = None  # caminho do arquivo (quando ativo)
-
-    def set_log_file(self, path):
-        """Ativa gravação em arquivo. Cria o diretório se necessário."""
-        self.log_file = path
-        if path:
-            dir_log = os.path.dirname(path)
-            if dir_log and not os.path.isdir(dir_log):
-                try:
-                    os.makedirs(dir_log, exist_ok=True)
-                except Exception:
-                    self.log_file = None
-
-    def log(self, mensagem, tipo="INFO"):
-        """Adiciona log com timestamp (tela + arquivo se configurado)."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        log_entry = f"[{timestamp}] [{tipo}] {mensagem}"
-        self.logs.append(log_entry)
-
-        if self.log_callback:
-            self.log_callback(log_entry, tipo)
-
-        if self.log_file:
-            try:
-                with open(self.log_file, "a", encoding="utf-8") as f:
-                    f.write(log_entry + "\n")
-            except Exception:
-                pass
-
-        print(log_entry)
-
-    def get_logs(self):
-        """Retorna todos os logs"""
-        return "\n".join(self.logs)
+from logging_utils import Logger, _ts
+from sifama_constantes_inscricao import (
+    URL_LOGIN,
+    XP_CAMPO_AUTO_CONSULTA,
+    XP_LOGIN_BOTAO,
+    XP_LOGIN_SENHA,
+    XP_LOGIN_USUARIO,
+    XP_POPUP_OK,
+)
 
 
 class BaseAutomacao:
-    """Classe base para as automações"""
+    """Base comum das automações do SIFAMA."""
     def __init__(self, logger=None):
         self.driver = None
         self.wait = None
@@ -87,7 +51,7 @@ class BaseAutomacao:
         self.senha_login = None
         
     def criar_driver(self, headless=False):
-        """Cria o driver do Chrome em modo anônimo/privado"""
+        """Cria o Chrome com as opções usadas no fluxo da automação."""
         try:
             if headless:
                 self.logger.log("Iniciando navegador Chrome em modo headless (oculto)...", "INFO")
@@ -99,8 +63,15 @@ class BaseAutomacao:
             options.add_argument('--disable-blink-features=AutomationControlled')
             options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
             options.add_experimental_option('useAutomationExtension', False)
-            
-            # Suprimir erros e logs desnecessários do Chrome
+
+            # Evita que o Chrome desacelere demais quando fica em segundo plano.
+            options.add_argument('--disable-backgrounding-occluded-windows')
+            options.add_argument('--disable-renderer-backgrounding')
+            options.add_argument('--disable-background-timer-throttling')
+            options.add_argument('--disable-background-networking')
+            options.add_argument('--force-fieldtrials=BackgroundRendererProcessLimit/0')
+
+            # Limpa parte do ruído que o Chrome costuma soltar.
             options.add_argument('--log-level=3')  # Suprime logs (0=INFO, 1=WARNING, 2=ERROR, 3=FATAL)
             options.add_argument('--disable-logging')
             options.add_argument('--disable-dev-shm-usage')
@@ -122,29 +93,29 @@ class BaseAutomacao:
             return False
     
     def fazer_login(self, usuario, senha):
-        """Realiza o login no sistema SIFAMA"""
+        """Faz o login no SIFAMA."""
         try:
-            # Armazenar credenciais para uso em caso de erro de servidor
+            # Guarda as credenciais para um eventual relogin.
             self.usuario_login = usuario
             self.senha_login = senha
             
             self.logger.log("Acessando página de login...", "INFO")
-            self.driver.get("https://appweb1.antt.gov.br/sca/Site/Login.aspx")
+            self.driver.get(URL_LOGIN)
             time.sleep(2)
             
             campo_usuario = None
             campo_senha = None
             botao_entrar = None
             
-            # Estratégia 1: Buscar por ID específico (XPath atualizado)
+            # Primeiro tenta pelo caminho mais direto.
             try:
                 campo_usuario = self.wait.until(
-                    EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_TextBoxUsuario"]'))
+                    EC.presence_of_element_located((By.XPATH, XP_LOGIN_USUARIO))
                 )
-                campo_senha = self.driver.find_element(By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_TextBoxSenha"]')
-                botao_entrar = self.driver.find_element(By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ButtonOk"]')
+                campo_senha = self.driver.find_element(By.XPATH, XP_LOGIN_SENHA)
+                botao_entrar = self.driver.find_element(By.XPATH, XP_LOGIN_BOTAO)
             except:
-                # Estratégia 2: Buscar por atributos
+                # Se falhar, tenta uma busca mais aberta pelos campos.
                 try:
                     campos_input = self.driver.find_elements(By.TAG_NAME, "input")
                     for campo in campos_input:
@@ -184,12 +155,12 @@ class BaseAutomacao:
             return False
     
     def aguardar_pausa(self):
-        """Aguarda enquanto estiver pausado"""
+        """Segura a execução enquanto a automação estiver pausada."""
         while self.pausado and not self.parar:
             time.sleep(0.5)
 
     def _obter_texto_body(self, driver=None):
-        """Obtém o texto da página via JS para evitar StaleElementReferenceException durante postbacks ASP.NET."""
+        """Lê o texto da página via JS para fugir de stale em postback."""
         d = driver or self.driver
         try:
             return d.execute_script("return document.body ? document.body.innerText : ''") or ""
@@ -197,7 +168,7 @@ class BaseAutomacao:
             return ""
 
     def _aguardar_overlay_sumir(self, timeout=8):
-        """Aguarda overlays de carregamento (Progress_*) sumirem antes de cliques. Evita clique interceptado."""
+        """Espera os overlays sumirem antes de clicar para evitar clique interceptado."""
         try:
             for id_overlay in ("Progress_ModalProgress_backgroundElement", "Progress_UpdateProgress"):
                 try:
@@ -212,12 +183,10 @@ class BaseAutomacao:
             pass
 
     def verificar_erro_servidor(self):
-        """Verifica se há erro de servidor na página (Server Error / Runtime Error)"""
+        """Confere se a página caiu em erro de servidor."""
         try:
-            # Verificar texto da página (via JS para evitar stale element durante postbacks)
+            # Aqui o texto via JS costuma ser mais confiável que pegar elemento.
             texto_pagina = self._obter_texto_body()
-            
-            # Verificar se contém mensagens de erro do servidor
             if "Server Error" in texto_pagina or "Runtime Error" in texto_pagina or "Server Error in '/sar' Application" in texto_pagina:
                 self.logger.log("Erro de servidor detectado na página! Tentando recarregar...", "WARNING")
                 return True
@@ -226,16 +195,16 @@ class BaseAutomacao:
             return False
     
     def tratar_erro_servidor(self, tentar_navegar_novamente=False):
-        """Trata erro de servidor abrindo nova guia, fechando a com erro e refazendo login/navegação"""
+        """Tenta se recuperar do erro abrindo nova guia e refazendo o caminho."""
         try:
             self.logger.log("=== INICIANDO TRATAMENTO DE ERRO DE SERVIDOR ===", "WARNING")
             self.logger.log("Abrindo nova guia e fechando a com erro...", "INFO")
             
-            # Abrir nova guia
+            # Abre uma guia limpa.
             self.driver.execute_script("window.open('');")
             time.sleep(0.5)
             
-            # Obter todas as janelas/abas
+            # Pega as guias abertas.
             janelas = self.driver.window_handles
             self.logger.log(f"Total de janelas encontradas: {len(janelas)}", "INFO")
             
@@ -243,12 +212,12 @@ class BaseAutomacao:
                 self.logger.log("Erro: Não foi possível criar nova guia!", "ERROR")
                 return False
             
-            # Mudar para a nova aba (última)
+            # Vai para a guia nova.
             self.driver.switch_to.window(janelas[-1])
             self.logger.log("Mudado para nova guia", "INFO")
             time.sleep(0.5)
             
-            # Fechar a aba antiga (com erro)
+            # Fecha a guia que ficou com erro.
             try:
                 self.driver.switch_to.window(janelas[0])
                 time.sleep(0.3)
@@ -258,7 +227,7 @@ class BaseAutomacao:
             except Exception as e:
                 self.logger.log(f"Aviso ao fechar aba antiga: {str(e)}", "WARNING")
             
-            # Voltar para a nova aba
+            # Volta a trabalhar na guia boa.
             janelas_restantes = self.driver.window_handles
             if janelas_restantes:
                 self.driver.switch_to.window(janelas_restantes[-1])
@@ -268,12 +237,12 @@ class BaseAutomacao:
                 return False
             time.sleep(0.5)
             
-            # Ir para página de login
+            # Recomeça pelo login.
             self.logger.log("Navegando para página de login...", "INFO")
-            self.driver.get("https://appweb1.antt.gov.br/sca/Site/Login.aspx")
+            self.driver.get(URL_LOGIN)
             time.sleep(2)
             
-            # Se tiver credenciais armazenadas, fazer login novamente
+            # Se as credenciais estiverem guardadas, já tenta relogar.
             if self.usuario_login and self.senha_login:
                 self.logger.log("Fazendo login novamente na nova guia...", "INFO")
                 if not self.fazer_login(self.usuario_login, self.senha_login):
@@ -285,12 +254,12 @@ class BaseAutomacao:
                 self.logger.log("Credenciais não disponíveis para refazer login.", "WARNING")
                 return False
             
-            # Se precisar refazer navegação, retornar True para que o código chame navegar_para_formulario
+            # Se quem chamou quiser, a navegação completa pode ser refeita depois.
             if tentar_navegar_novamente:
                 self.logger.log("=== TRATAMENTO CONCLUÍDO: Pronto para refazer navegação ===", "SUCCESS")
                 return True
             
-            # Verificar se ainda tem erro na nova guia
+            # Se ainda sobrou algum erro, tenta refresh antes de devolver.
             if self.verificar_erro_servidor():
                 self.logger.log("Erro de servidor ainda presente na nova guia. Aguardando...", "WARNING")
                 time.sleep(3)
@@ -303,7 +272,7 @@ class BaseAutomacao:
             import traceback
             self.logger.log(f"Erro ao tratar erro de servidor: {str(e)}", "ERROR")
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
-            # Tentar pelo menos recarregar como fallback
+            # Último recurso: recarrega e devolve o controle.
             try:
                 self.driver.refresh()
                 time.sleep(2)
@@ -313,7 +282,7 @@ class BaseAutomacao:
 
     @staticmethod
     def _mensagem_erro_navegacao(exc):
-        """ChromeDriver às vezes retorna exceção com str() vazio — monta mensagem útil."""
+        """Monta uma mensagem útil quando o ChromeDriver volta quase sem detalhe."""
         msg = (str(exc) or "").strip()
         if msg:
             return msg
@@ -477,20 +446,20 @@ class CheckpointManager:
 
 
 class AutomacaoConsultaPagamento(BaseAutomacao):
-    """Automação para consulta de pagamento (Situação da Dívida)"""
+    """Fluxo de consulta de pagamento e situação da dívida."""
     
     def __init__(self, logger=None):
         super().__init__(logger)
         self.resultados = []
     
     def navegar_para_formulario(self):
-        """Navega até o formulário de consulta"""
+        """Navega até a tela de consulta."""
         xp_menu0 = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn0"]/table/tbody/tr/td/a'
         xp_menu5 = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn5"]/td/table/tbody/tr/td/a'
         xp_menu5_abs = '/html/body/form/div[4]/div[3]/table/tbody/tr/td[1]/div[8]/table/tbody/tr[1]/td/table/tbody/tr/td/a'
         xp_m2 = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_menun2"]/table/tbody/tr/td/a'
         xp_m19 = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_menun19"]/td/table/tbody/tr/td/a'
-        xp_campo = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_txbAutoInfracao"]'
+        xp_campo = XP_CAMPO_AUTO_CONSULTA
         try:
             self.logger.log("Navegando até o formulário de consulta...", "INFO")
             self._aguardar_overlay_sumir(timeout=12)
@@ -516,7 +485,7 @@ class AutomacaoConsultaPagamento(BaseAutomacao):
             return False
     
     def consultar_auto(self, numero_auto):
-        """Consulta um auto e retorna a situação da dívida"""
+        """Consulta um auto e devolve o resultado da pesquisa."""
         try:
             self.aguardar_pausa()
             if self.parar:
@@ -524,23 +493,23 @@ class AutomacaoConsultaPagamento(BaseAutomacao):
             
             self.logger.log(f"Consultando auto: {numero_auto}...", "INFO")
             
-            # Preencher campo
+            # Preenche o auto.
             campo_auto = self.wait.until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_txbAutoInfracao"]'))
+                EC.presence_of_element_located((By.XPATH, XP_CAMPO_AUTO_CONSULTA))
             )
             campo_auto.clear()
             campo_auto.send_keys(str(numero_auto))
             
-            # Clicar em Gerar
+            # Dispara a consulta.
             botao_gerar = self.wait.until(
                 EC.element_to_be_clickable((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_btnGerar"]'))
             )
             botao_gerar.click()
             
-            # Aguardar um pouco para o sistema processar (tem carregamento)
+            # Dá um tempo curto para o portal processar.
             time.sleep(2)
             
-            # Verificar se há erro de servidor
+            # Se o portal caiu em erro, tenta se recuperar antes de desistir.
             if self.verificar_erro_servidor():
                 self.logger.log("Erro de servidor detectado após clicar em Gerar!", "ERROR")
                 if self.tratar_erro_servidor(tentar_navegar_novamente=True):
@@ -551,7 +520,7 @@ class AutomacaoConsultaPagamento(BaseAutomacao):
                     # Tentar consultar novamente o MESMO auto
                     self.logger.log(f"Retentando consulta do auto {numero_auto} após tratar erro...", "INFO")
                     campo_auto = self.wait.until(
-                        EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_txbAutoInfracao"]'))
+                        EC.presence_of_element_located((By.XPATH, XP_CAMPO_AUTO_CONSULTA))
                     )
                     campo_auto.clear()
                     campo_auto.send_keys(str(numero_auto))
@@ -573,7 +542,7 @@ class AutomacaoConsultaPagamento(BaseAutomacao):
             try:
                 # Usar timeout curto para não atrasar quando não houver popup
                 botao_ok = WebDriverWait(self.driver, 3).until(
-                    EC.element_to_be_clickable((By.XPATH, '//*[@id="MessageBox_ButtonOk"]'))
+                    EC.element_to_be_clickable((By.XPATH, XP_POPUP_OK))
                 )
                 self.logger.log("Popup de 'Nenhum registro encontrado' detectado, clicando em Ok...", "INFO")
                 botao_ok.click()
@@ -592,21 +561,18 @@ class AutomacaoConsultaPagamento(BaseAutomacao):
             return (False, False)
     
     def extrair_situacao_divida(self):
-        """Extrai a situação da dívida da página buscando diretamente o div com estilo específico"""
+        """Extrai a situação da dívida usando os caminhos mais estáveis que já deram certo."""
         try:
             time.sleep(1)  # Reduzido de 2s para 1s
             
-            # Verificar se há erro de servidor antes de extrair
+            # Antes de extrair, confere se a tela ainda está íntegra.
             if self.verificar_erro_servidor():
                 self.logger.log("Erro de servidor detectado ao tentar extrair situação!", "ERROR")
                 return None
             
-            # Buscar diretamente o div com o estilo específico que contém a situação
-            # Padrão: <div style="width:15.21mm;min-width: 15.21mm;">Quitada</div>
-            # ou <div style="width:15.21mm;min-width: 15.21mm;">Pendente</div>
-            # IMPORTANTE: Ignorar divs que contenham "Situação da Dívida" (label/cabeçalho)
+            # O cuidado aqui é não pegar o label no lugar do valor real.
             
-            # Estratégia 1: Buscar especificamente por "Quitada" ou "Pendente" dentro de divs com o estilo
+            # Começa pelos casos mais diretos.
             try:
                 # Buscar div que contém "Quitada" ou "Quitado"
                 try:
@@ -637,7 +603,7 @@ class AutomacaoConsultaPagamento(BaseAutomacao):
             except Exception as e:
                 self.logger.log(f"Erro na estratégia 1: {str(e)}", "WARNING")
             
-            # Estratégia 2: Buscar todos os divs com o estilo e filtrar corretamente
+            # Se não achou de primeira, faz uma varredura mais ampla.
             try:
                 divs = self.driver.find_elements(
                     By.XPATH, 
@@ -679,7 +645,7 @@ class AutomacaoConsultaPagamento(BaseAutomacao):
             except Exception as e:
                 self.logger.log(f"Erro na estratégia 2: {str(e)}", "WARNING")
             
-            # Estratégia 3: Buscar por XPath que exclui explicitamente o label
+            # Outra tentativa excluindo o label logo no XPath.
             try:
                 # Buscar div que NÃO contém "Situação" e "Dívida" mas contém o estilo
                 divs_validos = self.driver.find_elements(
@@ -705,7 +671,7 @@ class AutomacaoConsultaPagamento(BaseAutomacao):
             except Exception as e:
                 self.logger.log(f"Estratégia 3 falhou: {str(e)}", "WARNING")
             
-            # Estratégia 4: Buscar diretamente por texto "Quitada" ou "Pendente" na página e encontrar o div pai
+            # Último caminho: achar o texto e subir para o elemento útil.
             try:
                 texto_pagina = self._obter_texto_body()
                 
@@ -740,7 +706,7 @@ class AutomacaoConsultaPagamento(BaseAutomacao):
             except Exception as e:
                 self.logger.log(f"Estratégia 4 falhou: {str(e)}", "WARNING")
             
-            # Se nenhuma estratégia funcionou, retornar None (NÃO retornar o label)
+            # Melhor devolver vazio do que devolver o texto errado.
             self.logger.log("Não foi possível extrair a situação da dívida (valor real não encontrado)!", "ERROR")
             return None
             
@@ -891,7 +857,7 @@ class AutomacaoConsultaPagamento(BaseAutomacao):
                 
                 # Limpar campo
                 try:
-                    campo_auto = self.driver.find_element(By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_txbAutoInfracao"]')
+                    campo_auto = self.driver.find_element(By.XPATH, XP_CAMPO_AUTO_CONSULTA)
                     campo_auto.clear()
                 except:
                     if not self.navegar_para_formulario():
@@ -1015,14 +981,14 @@ class AutomacaoConsultaPagamento(BaseAutomacao):
 
 
 class AutomacaoInscricaoSerasa(BaseAutomacao):
-    """Automação para inscrição de autos na SERASA"""
+    """Fluxo de pesquisa e seleção para inscrição na SERASA."""
     
     def __init__(self, logger=None):
         super().__init__(logger)
         self.resultados = []
     
     def navegar_para_formulario(self):
-        """Navega até o formulário de inscrição na SERASA"""
+        """Navega até a tela de inscrição na SERASA."""
         xp_menu0 = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn0"]/table/tbody/tr/td/a'
         xp_menu5 = '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn5"]/td/table/tbody/tr/td/a'
         xp_menu5_abs = '/html/body/form/div[4]/div[3]/table/tbody/tr/td[1]/div[8]/table/tbody/tr[1]/td/table/tbody/tr/td/a'
@@ -1054,7 +1020,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
             return False
     
     def pesquisar_auto(self, numero_auto):
-        """Pesquisa um auto no sistema"""
+        """Pesquisa um auto na tela da SERASA."""
         try:
             self.aguardar_pausa()
             if self.parar:
@@ -1062,7 +1028,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
 
             self.logger.log(f"Pesquisando auto: {numero_auto}...", "INFO")
 
-            # Preencher campo e esconder barra via JS numa única chamada
+            # Preenche o campo e já esconde a barra que costuma atrapalhar.
             self.driver.execute_script(
                 "var b=document.getElementById('wings_process_presentation_dashboard_bar');"
                 "if(b)b.style.display='none';"
@@ -1075,9 +1041,9 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
             while not self.parar:
                 tentativa += 1
 
-                # Overlay pode bloquear clique — aguardar sumir antes de clicar
+                # Se o overlay ainda estiver visível, segura um pouco antes do clique.
                 self._aguardar_overlay_sumir(timeout=8)
-                # Clicar em Pesquisar via JS: evita StaleElementReferenceException (não segura referência ao elemento)
+                # O clique por JS aqui costuma ser mais estável que manter a referência do botão.
                 clicou = False
                 for _t in range(3):
                     try:
@@ -1098,7 +1064,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                     )
                     return False
 
-                # Aguardar checkbox OU "Nenhum registro" (CSS selector mais rápido que XPath)
+                # Espera resultado ou a mensagem de que não houve retorno.
                 try:
                     def _checkbox_ou_nenhum(d):
                         try:
@@ -1131,8 +1097,8 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                         self.logger.log("Falha ao tratar erro de servidor!", "ERROR")
                         return False
 
-                # Aguarda a grid estabilizar após o postback ASP.NET.
-                time.sleep(1.0)
+                # Depois do postback, a grid ainda leva um instante para assentar.
+                time.sleep(2.0)
 
                 # Pesquisa concluída
                 return True
@@ -1151,7 +1117,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
             return False
     
     def verificar_resultado_pesquisa(self):
-        """Verifica se a pesquisa retornou resultados"""
+        """Confere se a pesquisa trouxe um resultado aproveitável."""
         from selenium.common.exceptions import StaleElementReferenceException
 
         def _buscar_checkboxes():
@@ -1160,7 +1126,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
             )
 
         try:
-            # Aguarda a grid estar presente ou "Nenhum registro" aparecer
+            # Espera a tela responder de um jeito ou de outro.
             try:
                 def _grid_ou_nenhum(d):
                     try:
@@ -1173,7 +1139,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
             except TimeoutException:
                 pass
 
-            # Busca os checkboxes — tenta até 3x caso o DOM ainda esteja sendo recriado (stale)
+            # Em postback o DOM às vezes reaparece, então vale tentar algumas vezes.
             checkboxes = []
             for tentativa in range(3):
                 try:
@@ -1195,7 +1161,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                 self.logger.log("Erro de servidor detectado ao verificar resultado!", "ERROR")
                 return "erro_servidor", 0
 
-            # Sem checkboxes → nenhum registro encontrado
+            # Sem checkbox, trata como não encontrado.
             if not checkboxes:
                 texto_pagina = self._obter_texto_body()
                 if "Nenhum registro" in texto_pagina:
@@ -1213,16 +1179,15 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
             return "erro", 0
     
     def _obter_checkbox_primeira_linha_dados(self):
-        """Retorna o checkbox da primeira LINHA DE DADOS (nunca o do cabeçalho 'selecionar todos').
-        Tenta ID exato primeiro (lookup O(1)), depois um XPath focado como fallback."""
-        # ID exato do primeiro checkbox de dados — lookup mais rápido possível
+        """Pega o checkbox da primeira linha real de dados, nunca o do cabeçalho."""
+        # Primeiro tenta pelo id exato, que é o caminho mais rápido.
         try:
             el = self.driver.find_element(By.ID, "Corpo_gdvAutoInfracao_ckSelecionar_0")
             if el.is_displayed():
                 return el
         except NoSuchElementException:
             pass
-        # Fallback: tbody da tabela específica
+        # Se não achar, cai para a busca focada na tabela.
         try:
             el = self.driver.find_element(
                 By.XPATH,
@@ -1233,6 +1198,65 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
         except NoSuchElementException:
             pass
         return None
+
+    def _ler_identificador_primeira_linha(self) -> str:
+        """Lê o identificador do débito (ex: FRMEV01960242025) da primeira linha de dados.
+        Tenta múltiplas estratégias. Retorna string vazia apenas se realmente não encontrar."""
+        try:
+            resultado = self.driver.execute_script("""
+                // Estratégia 1: id padrão GridView gerado pelo ASP.NET
+                var ids = [
+                    'Corpo_gdvAutoInfracao_lnkIdentificadorDebito_0',
+                    'ContentPlaceHolderCorpo_gdvAutoInfracao_lnkIdentificadorDebito_0',
+                    'Corpo_gdvAutoInfracao_Label1_0',
+                    'Corpo_gdvAutoInfracao_lnkDebito_0'
+                ];
+                for (var k = 0; k < ids.length; k++) {
+                    var el = document.getElementById(ids[k]);
+                    if (el) { var t = el.textContent.trim(); if (t.length > 3) return t; }
+                }
+
+                // Estratégia 2: qualquer link ou célula dentro da primeira linha de dados da grid
+                var grid = document.getElementById('Corpo_gdvAutoInfracao');
+                if (grid) {
+                    var rows = grid.querySelectorAll('tbody tr');
+                    for (var r = 0; r < rows.length; r++) {
+                        var row = rows[r];
+                        // Pular linhas de cabeçalho ou paginação (sem <td>)
+                        var cells = row.querySelectorAll('td');
+                        if (cells.length < 2) continue;
+
+                        // Procurar link com texto longo (identificador)
+                        var links = row.querySelectorAll('a');
+                        for (var i = 0; i < links.length; i++) {
+                            var txt = links[i].textContent.trim();
+                            if (txt.length > 5) return txt;
+                        }
+                        // Sem link: pegar texto da segunda célula (primeira costuma ser checkbox)
+                        var c1 = cells[1].textContent.trim();
+                        if (c1.length > 5) return c1;
+                    }
+                }
+
+                // Estratégia 3: campo de pesquisa — o valor digitado é o auto que foi buscado
+                var campo = document.getElementById('Corpo_txbAutoInfracao');
+                if (campo && campo.value && campo.value.trim().length > 3) return campo.value.trim();
+
+                return '';
+            """)
+            return str(resultado).strip() if resultado else ''
+        except Exception:
+            return ''
+
+    def _ler_auto_campo_pesquisa(self) -> str:
+        """Lê o valor atual do campo de pesquisa (campo onde o número do auto foi digitado)."""
+        try:
+            val = self.driver.execute_script(
+                "var f=document.getElementById('Corpo_txbAutoInfracao'); return f ? f.value.trim() : '';"
+            )
+            return str(val).strip() if val else ''
+        except Exception:
+            return ''
 
     def _aguardar_checkbox_marcado(self, timeout=4):
         """Aguarda o checkbox estar marcado (polling via JS). Sai assim que estiver checked — mais rápido que sleep fixo."""
@@ -1250,12 +1274,35 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
         except TimeoutException:
             return False
 
+    def _ler_estado_checkbox(self) -> bool:
+        """Lê o estado atual do checkbox via JS. Retorna True se marcado, False se desmarcado ou ausente."""
+        try:
+            return bool(self.driver.execute_script(
+                "var cb=document.querySelector('#Corpo_gdvAutoInfracao_ckSelecionar_0');"
+                "return !!(cb && cb.checked);"
+            ))
+        except Exception:
+            return False
+
     def _clicar_checkbox_auto(self):
-        """Clica no checkbox via JS e aguarda o sistema registrar (espera por condição, não sleep fixo)."""
+        """Clica no checkbox via JS com verificação estrita de mudança de estado.
+
+        Regra de ouro: só retorna True se o estado mudou de False → True.
+        Se o checkbox já estiver marcado ao entrar neste método, retorna False — o
+        chamador (processar_autos PASSO B) já tratou esse caso antes de chegar aqui,
+        portanto um checkbox marcado neste ponto indica condição inesperada.
+        """
         try:
             self._aguardar_overlay_sumir(timeout=5)
-            time.sleep(0.15)  # Estabilizar antes do clique
-            resultado = self.driver.execute_script(
+            time.sleep(0.25)  # Estabilizar antes de ler o estado
+
+            # Passo 1 — confirmar que o checkbox está desmarcado antes de clicar
+            if self._ler_estado_checkbox():
+                # Marcado inesperadamente neste ponto — não clicar para evitar desmarcar
+                return False
+
+            # Passo 2 — executar o clique
+            clicou = self.driver.execute_script(
                 "var b=document.getElementById('wings_process_presentation_dashboard_bar');"
                 "if(b)b.style.display='none';"
                 "var cb=document.querySelector('#Corpo_gdvAutoInfracao_ckSelecionar_0');"
@@ -1263,36 +1310,36 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                 "cb.click();"
                 "return true;"
             )
-            if not resultado:
+            if not clicou:
                 return False
-            # Espera por condição: segue assim que o checkbox ficar marcado (até 3s)
-            return self._aguardar_checkbox_marcado(timeout=3)
+
+            # Passo 3 — aguardar mudança desmarcado → marcado (até 4 s)
+            if not self._aguardar_checkbox_marcado(timeout=4):
+                return False
+
+            # Passo 4 — confirmação final do estado
+            return self._ler_estado_checkbox()
+
         except Exception:
             return False
 
-    def _checkbox_foi_validado(self, max_tentativas=4, intervalo=0.3):
-        """Verifica com retentativas se o checkbox está marcado. Só retorna True se realmente estiver checked."""
+    def _checkbox_foi_validado(self, max_tentativas=4, intervalo=0.35):
+        """Verifica com retentativas se o checkbox continua marcado após o clique.
+        Só retorna True se realmente estiver checked em ao menos uma das tentativas."""
         for _ in range(max_tentativas):
             try:
                 time.sleep(intervalo)
-                marcado = self.driver.execute_script(
-                    "var cb=document.querySelector('#Corpo_gdvAutoInfracao_ckSelecionar_0');"
-                    "return cb ? cb.checked === true : false;"
-                )
-                if marcado:
+                if self._ler_estado_checkbox():
                     return True
             except Exception:
                 pass
         return False
 
-    def _checkbox_ainda_marcado_apos_delay(self, delay=0.5):
-        """Confirma que o checkbox continua marcado após um pequeno delay (evita falso positivo)."""
+    def _checkbox_ainda_marcado_apos_delay(self, delay=0.4):
+        """Confirmação final: checkbox deve continuar marcado após um delay adicional."""
         try:
             time.sleep(delay)
-            return self.driver.execute_script(
-                "var cb=document.querySelector('#Corpo_gdvAutoInfracao_ckSelecionar_0');"
-                "return cb ? cb.checked === true : false;"
-            )
+            return self._ler_estado_checkbox()
         except Exception:
             return False
     
@@ -1368,7 +1415,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
             return False
     
     def limpar_formulario(self):
-        """Limpa o formulário usando o botão Limpar"""
+        """Limpa a tela para o próximo auto."""
         try:
             botao_limpar = self.wait.until(
                 EC.element_to_be_clickable((By.XPATH, '//*[@id="Corpo_btnLimpar"]'))
@@ -1382,7 +1429,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
             return False
     
     def _verificar_sessao_expirada(self) -> bool:
-        """Retorna True se a sessão expirou (voltou para tela de login)."""
+        """Detecta se a sessão voltou para a tela de login."""
         try:
             url = self.driver.current_url or ""
             return "Login" in url or "login" in url.lower()
@@ -1392,12 +1439,12 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
     def processar_autos(self, autos, progress_callback=None, stats_callback=None,
                         error_handler=None, checkpoint: "CheckpointManager | None" = None,
                         idx_inicio: int = 0):
-        """Processa todos os autos apenas selecionando checkboxes (sem incluir na SERASA)"""
+        """Percorre os autos e deixa a seleção pronta, sem concluir a inclusão."""
         total = len(autos)
         sucessos = 0
         erros = 0
 
-        # Carregar resultados já salvos no checkpoint (se retomando)
+        # Se a execução estiver sendo retomada, reaproveita o que já tinha sido salvo.
         if checkpoint and checkpoint.existe() and idx_inicio > 0:
             dados_cp = checkpoint.carregar()
             resultados_anteriores = dados_cp.get("resultados", [])
@@ -1415,7 +1462,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
             if not auto:
                 continue
 
-            # ── Melhoria 5: detecção de sessão expirada ──
+            # Se a sessão cair, tenta restaurar antes de perder o andamento.
             if self._verificar_sessao_expirada():
                 self.logger.log("Sessão expirada detectada — refazendo login automaticamente...", "WARNING")
                 if self.usuario_login and self.senha_login:
@@ -1435,11 +1482,11 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                 if progress_callback:
                     progress_callback(f"Processando {idx+1}/{total}: {auto}")
 
-                # ── Melhoria 3: delay humanizado — variação aleatória entre autos ──
+                # Um intervalo curto entre autos ajuda o portal a responder melhor.
                 if idx > idx_inicio:
-                    time.sleep(random.uniform(0.10, 0.35))
+                    time.sleep(random.uniform(0.8, 1.5))
                 
-                # Pesquisar auto (com uma retentativa se falhar — evita perder auto por stale transitório)
+                # Se a primeira pesquisa falhar, ainda tenta uma segunda vez.
                 if not self.pesquisar_auto(auto):
                     self.logger.log(f"Auto {auto}: primeira tentativa de pesquisa falhou — retentando uma vez...", "WARNING")
                     time.sleep(0.6)
@@ -1458,12 +1505,12 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                         continue
                     self.logger.log(f"Auto {auto}: pesquisa OK na retentativa.", "INFO")
                 
-                # Verificar resultado
+                # Com a pesquisa concluída, interpreta o retorno da tela.
                 status, quantidade = self.verificar_resultado_pesquisa()
                 
                 if status == "erro_servidor":
                     self.logger.log(f"Auto {auto}: Erro de servidor detectado", "ERROR")
-                    # Tentar tratar erro (abrir nova guia, refazer login e navegação)
+                    # Quando o portal quebra, tenta se recuperar e seguir do mesmo ponto.
                     if self.tratar_erro_servidor(tentar_navegar_novamente=True):
                         if not self.navegar_para_formulario():
                             self.logger.log("Não foi possível navegar após tratar erro. Interrompendo...", "ERROR")
@@ -1536,25 +1583,107 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                     continue
                 
                 elif status == "encontrado":
-                    # Selecionar o checkbox, validar e exigir confirmação dupla para contar como sucesso
+                    # ── Seleção do checkbox com verificação de identidade + mudança de estado ──
                     try:
-                        if not self._clicar_checkbox_auto():
-                            # Fallback: JS puro sem busca Selenium
-                            self.driver.execute_script(
-                                "var b=document.getElementById('wings_process_presentation_dashboard_bar');"
-                                "if(b)b.style.display='none';"
-                                "var cb=document.querySelector('#Corpo_gdvAutoInfracao_ckSelecionar_0');"
-                                "if(cb)cb.click();"
+                        # ── PASSO A: Confirmar que a grid mostra o auto correto ──
+                        # Quando outra janela fica na frente, o Chrome pode atrasar a atualização
+                        # do DOM mesmo após o postback concluir. Por isso, se o identificador
+                        # não bater, re-pesquisamos o auto em vez de simplesmente aguardar.
+                        ja_selecionado = False
+                        identificador_ok = False
+                        auto_upper = auto.strip().upper()
+
+                        def _confirmar_identidade() -> bool:
+                            """Lê o identificador da grid (ou campo de busca) e verifica se bate
+                            com o auto pesquisado. Retorna True se confirmado ou se não foi possível
+                            ler nenhum identificador (benefício da dúvida)."""
+                            nonlocal ja_selecionado
+                            ident = self._ler_identificador_primeira_linha()
+                            if not ident:
+                                ident = self._ler_auto_campo_pesquisa()
+                            estado = self._ler_estado_checkbox()
+                            if not ident:
+                                # Sem identificador legível — benefício da dúvida
+                                ja_selecionado = estado
+                                return True
+                            if auto_upper in ident.strip().upper():
+                                ja_selecionado = estado
+                                return True
+                            return False
+
+                        # Tentativa 1: identificador logo após a pesquisa (já aguardou 2 s)
+                        if _confirmar_identidade():
+                            identificador_ok = True
+                        else:
+                            # Grid ainda mostra auto anterior — aguardar mais 1.5 s e tentar de novo
+                            self.logger.log(
+                                f"Auto {auto}: Grid ainda mostra resultado anterior — aguardando mais.", "WARNING"
                             )
-                            time.sleep(0.5)
-                        # Validação: checkbox deve estar marcado (várias tentativas)
+                            time.sleep(1.5)
+                            if _confirmar_identidade():
+                                identificador_ok = True
+                            else:
+                                # DOM persiste desatualizado — RE-PESQUISAR o auto
+                                self.logger.log(
+                                    f"Auto {auto}: Re-pesquisando para forçar atualização da grid.", "WARNING"
+                                )
+                                if self.pesquisar_auto(auto):
+                                    time.sleep(1.0)
+                                    if _confirmar_identidade():
+                                        identificador_ok = True
+                                    else:
+                                        self.logger.log(
+                                            f"Auto {auto}: Grid ainda divergente após re-pesquisa. Pulando.", "ERROR"
+                                        )
+                                else:
+                                    self.logger.log(
+                                        f"Auto {auto}: Re-pesquisa falhou. Pulando.", "ERROR"
+                                    )
+
+                        if not identificador_ok:
+                            self.resultados.append({'auto': auto, 'situacao': 'RESULTADO INCORRETO NA GRID', 'horario': _ts()})
+                            erros += 1
+                            if stats_callback:
+                                stats_callback(sucessos, erros)
+                            if idx + 1 < total:
+                                self._preparar_proximo_auto(autos[idx + 1])
+                            continue
+
+                        # ── PASSO B: Auto já estava selecionado — contar como sucesso ──
+                        if ja_selecionado:
+                            self.logger.log(
+                                f"Auto {auto}: Já estava selecionado no sistema. Contabilizado como sucesso.", "SUCCESS"
+                            )
+                            self.resultados.append({'auto': auto, 'situacao': 'SELECIONADO', 'horario': _ts()})
+                            sucessos += 1
+                            if stats_callback:
+                                stats_callback(sucessos, erros)
+                            if idx + 1 < total:
+                                self._preparar_proximo_auto(autos[idx + 1])
+                            continue
+
+                        # ── PASSO C: Clicar no checkbox (checkbox está desmarcado e grid é o auto correto) ──
+                        clique_ok = self._clicar_checkbox_auto()
+
+                        if not clique_ok:
+                            # Fallback: só clicar se ainda estiver desmarcado
+                            if not self._ler_estado_checkbox():
+                                self.logger.log(f"Auto {auto}: Clique principal falhou — tentando fallback.", "WARNING")
+                                self.driver.execute_script(
+                                    "var b=document.getElementById('wings_process_presentation_dashboard_bar');"
+                                    "if(b)b.style.display='none';"
+                                    "var cb=document.querySelector('#Corpo_gdvAutoInfracao_ckSelecionar_0');"
+                                    "if(cb && !cb.checked)cb.click();"
+                                )
+                                time.sleep(0.6)
+
+                        # ── PASSO D: Validação dupla do estado final ──
                         if not self._checkbox_foi_validado():
                             self.logger.log(f"Auto {auto}: Clique no checkbox não foi validado pelo sistema (não contou).", "WARNING")
                             self.resultados.append({'auto': auto, 'situacao': 'CLIQUE NÃO VALIDADO', 'horario': _ts()})
                             erros += 1
                             if stats_callback:
                                 stats_callback(sucessos, erros)
-                        # Confirmação dupla: após mais um delay, checkbox ainda deve estar marcado
                         elif not self._checkbox_ainda_marcado_apos_delay(delay=0.3):
                             self.logger.log(f"Auto {auto}: Checkbox não permaneceu marcado após confirmação (não contou).", "WARNING")
                             self.resultados.append({'auto': auto, 'situacao': 'CLIQUE NÃO CONFIRMADO', 'horario': _ts()})
@@ -1562,7 +1691,7 @@ class AutomacaoInscricaoSerasa(BaseAutomacao):
                             if stats_callback:
                                 stats_callback(sucessos, erros)
                         else:
-                            self.logger.log(f"Auto {auto}: Checkbox selecionado e validado (confirmação dupla)!", "SUCCESS")
+                            self.logger.log(f"Auto {auto}: Checkbox selecionado e validado!", "SUCCESS")
                             self.resultados.append({'auto': auto, 'situacao': 'SELECIONADO', 'horario': _ts()})
                             sucessos += 1
                             if stats_callback:
@@ -2521,6 +2650,10 @@ class InterfaceGrafica:
         self.sucessos = 0
         self.erros = 0
         self._atualizar_stats_ui()
+        # Resetar variáveis de ETA para o reprocessamento
+        self._tempo_inicio_auto = None
+        self._idx_atual_eta = 0
+        self._total_autos_eta = len(self.ultimos_autos_com_erro)
         self.thread_automacao = threading.Thread(target=self._executar_reprocessar_erros, daemon=True)
         self.thread_automacao.start()
     
@@ -2533,11 +2666,13 @@ class InterfaceGrafica:
             self.automacao.pausado = False
             sucessos, erros = self.automacao.processar_autos(
                 autos_erro,
-                progress_callback=self._atualizar_progresso,
+                progress_callback=self._atualizar_progresso_com_eta,
                 stats_callback=self.atualizar_estatisticas,
                 error_handler=self._tratar_erro
             )
             caminho_resultado = self.automacao.salvar_resultados(self.planilha_path, sufixo_arquivo="Reprocessamento")
+            if caminho_resultado:
+                self.automacao.salvar_log_excel(caminho_resultado)
             self.logger.log("Reprocessamento concluído! Navegador permanece aberto.", "INFO")
             msg = f"Reprocessamento concluído!\n\nSucessos: {sucessos}\nErros: {erros}\n\n"
             if caminho_resultado:

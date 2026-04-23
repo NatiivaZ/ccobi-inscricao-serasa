@@ -18,6 +18,21 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 
+from sifama_constantes_inscricao import (
+    URL_LOGIN,
+    XP_BOTAO_GERAR,
+    XP_BOTAO_PORTAL_SISTEMAS,
+    XP_CAMPO_AUTO_CONSULTA,
+    XP_LOGIN_BOTAO,
+    XP_LOGIN_SENHA,
+    XP_LOGIN_USUARIO,
+    XP_MENU_CONSULTA_SITUACAO,
+    XP_MENU_PRIMEIRA_OPCAO,
+    XP_MENU_SEGUNDO_NIVEL,
+    XP_MENU_SISTEMAS,
+    XP_POPUP_OK,
+)
+
 
 class AutomacaoSIFAMA:
     def __init__(self):
@@ -59,7 +74,7 @@ class AutomacaoSIFAMA:
     def fazer_login(self, usuario, senha):
         """Realiza o login no sistema SIFAMA"""
         try:
-            self.driver.get("https://appweb1.antt.gov.br/sca/Site/Login.aspx")
+            self.driver.get(URL_LOGIN)
             time.sleep(2)
             
             # Tentar encontrar campos de login (IDs podem variar)
@@ -70,10 +85,10 @@ class AutomacaoSIFAMA:
             # Estratégia 1: Buscar por XPath específico (atualizado)
             try:
                 campo_usuario = self.wait.until(
-                    EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_TextBoxUsuario"]'))
+                    EC.presence_of_element_located((By.XPATH, XP_LOGIN_USUARIO))
                 )
-                campo_senha = self.driver.find_element(By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_TextBoxSenha"]')
-                botao_entrar = self.driver.find_element(By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ButtonOk"]')
+                campo_senha = self.driver.find_element(By.XPATH, XP_LOGIN_SENHA)
+                botao_entrar = self.driver.find_element(By.XPATH, XP_LOGIN_BOTAO)
             except:
                 # Estratégia 2: Buscar por name ou placeholder
                 try:
@@ -125,14 +140,14 @@ class AutomacaoSIFAMA:
         try:
             # Passo 1: Hover no primeiro elemento
             elemento_hover_1 = self.wait.until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn0"]/table/tbody/tr/td/a'))
+                EC.presence_of_element_located((By.XPATH, XP_MENU_SISTEMAS))
             )
             ActionChains(self.driver).move_to_element(elemento_hover_1).perform()
             time.sleep(0.8)  # Delay para submenu aparecer
             
             # Passo 2: Clicar no botão que aparece após hover
             botao_1 = self.wait.until(
-                EC.element_to_be_clickable((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn5"]/td/table/tbody/tr/td/a'))
+                EC.element_to_be_clickable((By.XPATH, XP_MENU_PRIMEIRA_OPCAO))
             )
             botao_1.click()
             time.sleep(2)  # Aguardar página carregar
@@ -140,20 +155,20 @@ class AutomacaoSIFAMA:
             # Após clicar nos dois primeiros botões, clicar no botão "Portal de Sistemas" se aparecer
             try:
                 botao_portal = self.wait.until(
-                    EC.element_to_be_clickable((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_btnPortalSistemas"]'))
+                    EC.element_to_be_clickable((By.XPATH, XP_BOTAO_PORTAL_SISTEMAS))
                 )
                 botao_portal.click()
                 time.sleep(2)
                 
                 # Após clicar no Portal de Sistemas, clicar novamente nos dois botões
                 elemento_hover_1_novo = self.wait.until(
-                    EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn0"]/table/tbody/tr/td/a'))
+                    EC.presence_of_element_located((By.XPATH, XP_MENU_SISTEMAS))
                 )
                 ActionChains(self.driver).move_to_element(elemento_hover_1_novo).perform()
                 time.sleep(0.8)
                 
                 botao_1_novo = self.wait.until(
-                    EC.element_to_be_clickable((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_MenuSistemasn5"]/td/table/tbody/tr/td/a'))
+                    EC.element_to_be_clickable((By.XPATH, XP_MENU_PRIMEIRA_OPCAO))
                 )
                 botao_1_novo.click()
                 time.sleep(2)
@@ -163,21 +178,21 @@ class AutomacaoSIFAMA:
             
             # Passo 3: Hover no segundo elemento
             elemento_hover_2 = self.wait.until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_menun2"]/table/tbody/tr/td/a'))
+                EC.presence_of_element_located((By.XPATH, XP_MENU_SEGUNDO_NIVEL))
             )
             ActionChains(self.driver).move_to_element(elemento_hover_2).perform()
             time.sleep(0.8)  # Delay para submenu aparecer
             
             # Passo 4: Clicar no botão que aparece após hover
             botao_2 = self.wait.until(
-                EC.element_to_be_clickable((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderMenu_menun19"]/td/table/tbody/tr/td/a'))
+                EC.element_to_be_clickable((By.XPATH, XP_MENU_CONSULTA_SITUACAO))
             )
             botao_2.click()
             time.sleep(2)  # Aguardar página carregar
             
             # Aguardar campo de auto aparecer (confirma que chegou na página correta)
             self.wait.until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_txbAutoInfracao"]'))
+                EC.presence_of_element_located((By.XPATH, XP_CAMPO_AUTO_CONSULTA))
             )
             return True
             
@@ -192,14 +207,14 @@ class AutomacaoSIFAMA:
         try:
             # Limpar e preencher campo
             campo_auto = self.wait.until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_txbAutoInfracao"]'))
+                EC.presence_of_element_located((By.XPATH, XP_CAMPO_AUTO_CONSULTA))
             )
             campo_auto.clear()
             campo_auto.send_keys(str(numero_auto))
             
             # Clicar em Gerar
             botao_gerar = self.wait.until(
-                EC.element_to_be_clickable((By.XPATH, '//*[@id="ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_ContentPlaceHolderCorpo_btnGerar"]'))
+                EC.element_to_be_clickable((By.XPATH, XP_BOTAO_GERAR))
             )
             botao_gerar.click()
             
@@ -210,7 +225,7 @@ class AutomacaoSIFAMA:
             try:
                 # Usar timeout curto para não atrasar quando não houver popup
                 botao_ok = WebDriverWait(self.driver, 3).until(
-                    EC.element_to_be_clickable((By.XPATH, '//*[@id="MessageBox_ButtonOk"]'))
+                    EC.element_to_be_clickable((By.XPATH, XP_POPUP_OK))
                 )
                 print(f"Popup de 'Nenhum registro encontrado' detectado para auto {numero_auto}, clicando em Ok...")
                 botao_ok.click()
